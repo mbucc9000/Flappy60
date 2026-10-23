@@ -9,7 +9,11 @@ App Store apps; /Applications icons are drawn as-is, so the square App Store ico
 get rounded corners baked in here. The edited Info.plist and icons are covered by
 the code signature (CodeDirectory slot -1 = Info.plist, slot -3 = CodeResources,
 which seals each icon), so those hashes are recomputed. Every page hash is checked
-to still match, except the pages this script patches (GC_PATCH), which are re-hashed.
+to still match, except the pages this script patches (GC_PATCH and the header page
+that gets the load command), which are re-hashed.
+It also adds noshadercache/NoShaderCache.dylib (built with Theos in the VM, see its
+Makefile) to the .app and loads it with an LC_LOAD_DYLIB in the header padding; it
+turns the GL shader cache off so a home press no longer kills the game (0xdead10cc).
 postinst runs uicache (as mobile only) so the icon updates without a respring; postrm
 only does it on remove.
 
@@ -24,13 +28,15 @@ APP_DIR = 'Applications/Flappy60fps.app'
 BUNDLE_ID = 'com.mbucc9000.flappybird60fps'
 DISPLAY_NAME = 'Flappy 60FPS'
 PKG = 'com.mbucc9000.flappybird60fps'
-VERSION = '1.1.0-3'
+VERSION = '1.1.0-4'
+DYLIB = os.path.join(HERE, 'noshadercache', 'NoShaderCache.dylib')
+LOAD_PATH = b'@executable_path/NoShaderCache.dylib'
 
 CONTROL = """Package: %s
 Name: Flappy 60FPS
 Version: %s
 Architecture: iphoneos-arm
-Description: Flappy Bird 1.1.0 drawing at 60fps instead of 30. The game logic already ran at 60 Hz, but it only drew every other frame. Game speed is unchanged. Also fixes the original game's crash on death when Game Center is signed in. Installs as its own app ("Flappy 60FPS") next to the original.
+Description: Flappy Bird 1.1.0 drawing at 60fps instead of 30. The game logic already ran at 60 Hz, but it only drew every other frame. Game speed is unchanged. Also fixes the original game's crash on death when Game Center is signed in, and the game closing every time you press home. Installs as its own app ("Flappy 60FPS") next to the original.
 Author: mbucc9000
 Maintainer: mbucc9000
 Section: Games
@@ -115,6 +121,42 @@ def patch(b):
     print('  patched 0x%x: skip the Game Center score report at death' % addr)
     return {o}
 
+def dylib_compat(d):
+    """compatibility version from the dylib's own LC_ID_DYLIB (Theos leaves it 0.0.0)."""
+    ncmds = struct.unpack_from('<I', d, 16)[0]
+    off = 28
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<2I', d, off)
+        if cmd == 0xd:
+            return struct.unpack_from('<I', d, off + 20)[0]
+        off += size
+    raise SystemExit('NoShaderCache.dylib has no LC_ID_DYLIB')
+
+def add_dylib(b, compat):
+    """Append an LC_LOAD_DYLIB for LOAD_PATH in the header padding (before the first section)."""
+    ncmds, sizeofcmds = struct.unpack_from('<2I', b, 16)
+    off, first_section = 28, None
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<2I', b, off)
+        if cmd in (0xc, 0x80000018):
+            name_off = struct.unpack_from('<I', b, off + 8)[0]
+            assert bytes(b[off + name_off:off + size]).rstrip(b'\0') != LOAD_PATH, 'binary already loads the dylib'
+        if cmd == 1:   # LC_SEGMENT: lowest non-zero section file offset
+            for j in range(struct.unpack_from('<I', b, off + 48)[0]):
+                o = struct.unpack_from('<I', b, off + 56 + 68 * j + 40)[0]
+                if o and (first_section is None or o < first_section):
+                    first_section = o
+        off += size
+    size = 24 + ((len(LOAD_PATH) + 1 + 3) & ~3)
+    at = 28 + sizeofcmds
+    assert at + size <= first_section, 'no header room'
+    assert not any(b[at:at + size]), 'header padding not empty'
+    # the load command's compat version must not exceed the dylib's own (0.0.0), or dyld refuses to load it
+    b[at:at + size] = (struct.pack('<6I', 0xc, size, 24, 2, compat, compat) + LOAD_PATH).ljust(size, b'\0')
+    struct.pack_into('<2I', b, 16, ncmds + 1, sizeofcmds + size)
+    print('  added load command for %s (%d bytes at 0x%x)' % (LOAD_PATH.decode(), size, at))
+    return {16, at}
+
 def resign(b, plist_bytes, code_resources, patched):
     for cd in code_directory(b):
         f = struct.unpack_from('>9I4BI', b, cd)
@@ -181,12 +223,15 @@ def main():
             icons[rel] = round_icon(z.read(name))
             assert rel in seal['files'], rel
             seal['files'][rel] = hashlib.sha1(icons[rel]).digest()
+    dylib = open(DYLIB, 'rb').read()
+    dylib_rel = LOAD_PATH.decode().split('/', 1)[1]
+    seal['files'][dylib_rel] = hashlib.sha1(dylib).digest()
     new_seal = plistlib.dumps(seal, fmt=plistlib.FMT_XML)
-    print('  rounded %d icons, resealed CodeResources' % len(icons))
+    print('  rounded %d icons, added %s, resealed CodeResources' % (len(icons), dylib_rel))
 
     exe = info['CFBundleExecutable']
     binary = bytearray(z.read(prefix + exe))
-    resign(binary, new_info, new_seal, patch(binary))
+    resign(binary, new_info, new_seal, add_dylib(binary, dylib_compat(dylib)) | patch(binary))
 
     dirs = {'./', './Applications/', './' + APP_DIR + '/'}
     files = []
@@ -210,6 +255,7 @@ def main():
             files.append((dest, new_seal, 0o644))
         else:
             files.append((dest, z.read(zi), 0o644))
+    files.append(('./' + APP_DIR + '/' + dylib_rel, dylib, 0o755))
     data = tar_gz([(d, None, 0o755) for d in sorted(dirs)] + sorted(files))
     control = tar_gz([('./', None, 0o755), ('./control', CONTROL.encode(), 0o644),
                       ('./postinst', POSTINST.encode(), 0o755), ('./postrm', POSTRM.encode(), 0o755)])

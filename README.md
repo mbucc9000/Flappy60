@@ -8,6 +8,8 @@ Flappy Bird drawing at a smooth 60fps on iOS 6, installed as its own app next to
 
 - A 4-byte patch: the game logic already ran at 60 Hz, and now every frame is drawn.
 - Game speed is unchanged.
+- Keeps running when you press home. iOS 6 kills /Applications apps that hold the GL shader cache's lock when they're suspended, so a tiny NoShaderCache.dylib turns that cache off.
+- Fixes the original game's crash on death when Game Center is signed in.
 - Installs as its own app, Flappy 60FPS, next to the original.
 - Game Center won't recognize it.
 
@@ -26,7 +28,7 @@ In Cydia, add `https://mbucc9000.github.io/slopkit/` and install **Flappy 60FPS*
 
 ## Building
 
-`py -3 build_flappy_deb.py` turns the 60fps IPA into the `.deb` (Python 3).
+`py -3 build_flappy_deb.py` turns the 60fps IPA into the `.deb` (Python 3 + Pillow). It adds `noshadercache/NoShaderCache.dylib`, built from that folder with [Theos](https://theos.dev); a built copy is included.
 
 ## License
 
